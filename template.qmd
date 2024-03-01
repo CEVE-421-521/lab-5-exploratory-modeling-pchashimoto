@@ -1,6 +1,6 @@
 ---
 title: "Lab 5: Sea-Level Rise"
-author: "<Your Name (NetID)>"
+author: "Patricia Hashimoto (pch3)>"
 jupyter: julia-1.10
 date: 2024-02-16
 
@@ -59,4 +59,279 @@ Plots.default(; margin=5Plots.mm)
 ```{julia}
 using Revise
 using HouseElevation
+```
+
+The house investigated in this model is at 415 Christopher Columbus Blvd, Galveston, TX 77550. According to Zillow, the interior of this house is 1,726 sqft and the value of the house is about $331,000. Google Maps estimates that this house is 3,243 ft from Galveston Pier 21, TX Station 8771450, which is located at Galveston Pier 21, TX - Station ID: 8771450. The USGS National Map Viewer estimates that the elevation of the house is about 5.86 ft, which I round to 6 ft. The depth-damage curve will be estimated using a HAZUS model. The house is two story and has no basement, according to Zillow, so the curve used will be the Galveston district curve for a two-story residential building with no basement.
+
+
+```{julia}
+#| output: false
+house = let
+    haz_fl_dept = CSV.read("data/haz_fl_dept.csv", DataFrame) # read in the file
+    desc = "two story, no basement, Contents"
+    source = "USACE - Galveston"
+    row = @rsubset(haz_fl_dept, :Description == desc, :Source == source)[1, :] # select the row I want
+    area = 1726u"ft^2"
+    height_above_gauge = 6u"ft"
+    House(
+        row;
+        area=area,
+        height_above_gauge=height_above_gauge,
+        value_usd=331_000,
+    )
+end
+```
+
+```{julia}
+include("depthdamage.jl")
+
+let
+    haz_fl_dept = CSV.read("data/haz_fl_dept.csv", DataFrame) # read in the file
+    desc = "two story, no basement, Contents"
+    source = "USACE - Galveston"
+    row = @rsubset(haz_fl_dept, :Description == desc, :Source == source)[1, :]
+    house_dd = DepthDamageData(row)
+    plot(
+        house_dd.depths,
+        house_dd.damages;
+        xlabel="Flood Depth at Building",
+        ylabel="Damage (%)",
+        label="$(house_dd.description) ($(house_dd.source))",
+        legend=:bottomright,
+        size=(700, 500),
+        title = "415 Christopher Columbus Damage-Damage Curve"
+    )
+end
+```
+
+```{julia}
+#| code-fold: true
+let
+    depths = uconvert.(u"ft", (-7.0u"ft"):(1.0u"inch"):(30.0u"ft"))
+    damages = house.ddf.(depths) ./ 100
+    damages_1000_usd = damages .* house.value_usd ./ 1000
+    scatter(
+        depths,
+        damages_1000_usd;
+        xlabel="Flood Depth",
+        ylabel="Damage (Thousand USD)",
+        label="$(house.description)\n($(house.source))",
+        legend=:bottomright,
+        size=(800, 400),
+        yformatter=:plain,
+        title = "Damage at Given Flood Depth"
+    )
+end
+```
+
+
+```{julia}
+let
+    elevations = 0u"ft":0.25u"ft":14u"ft"
+    costs = [elevation_cost(house, eᵢ) for eᵢ in elevations]
+    scatter(
+        elevations,
+        costs ./ 1_000;
+        xlabel="Elevation",
+        ylabel="Cost (Thousand USD)",
+        label="$(house.description)\n($(house.source))",
+        legend=:bottomright,
+        size=(800, 400),
+        yformatter=:plain,
+        title = "Cost of Elevating House"
+    )
+end
+```
+
+
+2. Read in the sea-level rise data
+
+```{julia}
+#| output: false
+slr_scenarios = let
+    df = CSV.read("data/slr_oddo.csv", DataFrame)
+    [Oddo17SLR(a, b, c, tstar, cstar) for (a, b, c, tstar, cstar) in eachrow(df)]
+end
+```
+
+3. Modify my code to create a function to draw samples of storm surge and the discount rate. Explain your modeling choices!
+
+I next define the distributions from which storm surges and discount rates will be sampled. The storm surge distribution is a hypothetical generalized extreme value distribution that is not rooted in actul storm data from the area.
+
+```{julia}
+function draw_surge_distribution()
+    μ = rand(Normal(5, 1))
+    σ = rand(Exponential(1.5))
+    ξ = rand(Normal(0.1, 0.05))
+    GeneralizedExtremeValue(μ, σ, ξ)
+end
+```
+
+The water level at the house is the water level at the gauge minus the elevation of the house above the gauge. The elevation of the gauge is 6.24 ft above MSL [^1], and the house is at 5.86 ft, so the water level at the house will be 0.38 ft above that at the gauge. 
+
+[^1]: https://tidesandcurrents.noaa.gov/stationhome.html?id=8771450
+
+
+The discount rate is treated as a random variable drawn from a normal distribution. A more accurate way to estimate the discount rate could be by modeling discount rate with autoregressive techniques, such as in Zarekarizi (2020). 
+
+```{julia}
+#| output: false
+function draw_discount_rate()
+    return rand(Normal(0.04, 0.02))
+end
+```
+
+4. Define an illustrative action, SOW, and model parameters, and run a simulation.
+
+I will first run a simulation in which the house is elevated 7 ft.
+
+```{julia}
+#| output: false
+a = Action(7.0u"ft")
+```
+
+```{julia}
+#| output: false
+p = ModelParams(
+    house=house,
+    years=2024:2050
+)
+```
+
+```{julia}
+#| output: false
+sow = SOW(
+    rand(slr_scenarios),
+    draw_surge_distribution() + .38,
+    draw_discount_rate()
+)
+```
+
+
+```{julia}
+res = run_sim(a, sow, p)
+```
+
+In this simulation, the net present value of raising the house 7 ft is $`$res`.
+
+I next run a large ensemble of simulations. Due to limitations in computing power, I will run the simulation 100 times. This time I include a range of options for action in which the building could be elevated from 1 to 14 ft, with the action randomly sampled from a uniform distribution. It is unlikely that a private homeowner would elevate a two story house more than one story.
+
+
+```{julia}
+sows = [SOW(rand(slr_scenarios), draw_surge_distribution(), draw_discount_rate()) for _ in 1:100] # for 10 SOWs
+actions = [Action(rand(1:14)*u"ft") for _ in 1:100] # these are all the same
+results = [run_sim(a, s, p) for (a, s) in zip(actions, sows)]
+```
+
+```{julia}
+df = DataFrame(
+    npv=results,
+    Δh_ft=[a.Δh_ft for a in actions],
+    slr_a=[s.slr.a for s in sows],
+    slr_b=[s.slr.b for s in sows],
+    slr_c=[s.slr.c for s in sows],
+    slr_tstar=[s.slr.tstar for s in sows],
+    slr_cstar=[s.slr.cstar for s in sows],
+    surge_μ=[s.surge_dist.μ for s in sows],
+    surge_σ=[s.surge_dist.σ for s in sows],
+    surge_ξ=[s.surge_dist.ξ for s in sows],
+    discount_rate=[s.discount_rate for s in sows],
+)
+```
+
+
+
+```{julia}
+using DataFrames
+using StatsPlots
+```
+
+
+
+```{julia}
+
+# Scatterplot of NPV vs. sea-level rise parameters
+scatter(df.slr_a, df.npv,
+    xlabel = "Action (House Elevation)",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Sea-Level Rise Parameter 'a'"
+)
+```
+
+```{julia}
+scatter(df.slr_b, df.npv,
+    xlabel = "SLR Parameter 'b'",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Sea-Level Rise Parameter 'b'"
+)
+```
+
+
+```{julia}
+scatter(df.slr_c, df.npv,
+    xlabel = "SLR Parameter 'c'",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Sea-Level Rise Parameter 'c'"
+)
+```
+
+
+```{julia}
+scatter(df.slr_tstar, df.npv,
+    xlabel = "SLR Parameter 'tstar'",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Sea-Level Rise Parameter 'tstar'"
+)
+
+scatter(df.slr_cstar, df.npv,
+    xlabel = "SLR Parameter 'cstar'",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Sea-Level Rise Parameter 'cstar'"
+)
+```
+
+The most parameters with the most visually obvious relationship to NPV appear to be the storm surge parameters. 
+
+```{julia}
+
+# Scatterplot of NPV vs. storm surge parameters
+scatter(df.surge_μ, df.npv,
+    xlabel = "Storm Surge Parameter 'μ'",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Storm Surge Parameter 'μ'"
+)
+```
+
+```{julia}
+
+scatter(df.surge_σ, df.npv,
+    xlabel = "Storm Surge Parameter 'σ'",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Storm Surge Parameter 'σ'"
+)
+```
+
+```{julia}
+# Scatterplot of NPV vs. elevation action
+scatter(df.Δh_ft, df.npv,
+    xlabel = "Elevation Action (ft)",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Elevation Action"
+)
+
+# Scatterplot of NPV vs. discount rate
+scatter(df.discount_rate, df.npv,
+    xlabel = "Discount Rate",
+    ylabel = "Net Present Value (NPV)",
+    title = "NPV vs. Discount Rate"
+)
+```
+
+```{julia}
+
+# Correlation matrix of parameters
+correlation_matrix = cor(Matrix(df[:, [:npv, :Δh_ft, :slr_a, :slr_b, :slr_c, :slr_tstar, :slr_cstar, :surge_μ, :surge_σ, :surge_ξ, :discount_rate]]))
+
+correlation_matrix
+
 ```
